@@ -1,0 +1,192 @@
+---
+title: "Massachusetts Education Data Analysis"
+author: "Mili Shah"
+format: pdf
+editor: visual
+---
+
+**Background Research**
+
+- high teacher turnover linked to lower student achievement and weakens structural support for student graduation
+
+  - impacts are worse in areas with higher poverty rates
+
+  - but turnover can be beneficial if they are being replaced with more qualified educators
+
+- chronic turnover can have worse implications by grade level. in high school, this could look like inconsistent academic advising and fewer staff to teacher required courses or electives.
+
+- primary drivers of teacher turnover:
+
+  -  Lower pay, lack of administrative support, heavy testing/accountability pressures, and early-career or alternative-route gaps contribute to higher departure rates.
+
+- Defining adjusted graduation rate in MA:
+
+  -  "tracks students who stayed in the *same* school or district for all four years (grades 9–12), helping measure how well a school serves its continuous, non-mobile student population."
+
+    - excludes late transfers
+
+- Use state totals unduplicated for teacher retention to see if MA is losing teachers generally from public education workforce.
+
+**Set Up**
+
+**Step 1: EDA**
+
+```{r}
+#| label: load-packages-and-data
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(vroom)
+library(patchwork)
+library(knitr)
+library(rstatix)
+library(skimr)
+
+code_cols <- cols(DIST_CODE = col_character(),
+                  ORG_CODE  = col_character(),
+                  SY        = col_integer())
+
+hs_grad_rates       <- read_csv("data/hs_grad_rates.csv",
+                                col_types = code_cols)  # 2006-2025
+student_achievement <- read_csv("data/student_achievement.csv",
+                                col_types = code_cols)  # 2017-2026
+teacher_retention   <- read_csv("data/teacher_retention.csv",
+                                col_types = code_cols)  # 2009-2026
+
+theme_set(theme_minimal(base_size = 10))
+
+snap_year <- 2024 # year for cross section snapshots
+```
+
+```{r}
+#| label: explore-data
+
+skim(hs_grad_rates)
+skim(student_achievement)
+skim(teacher_retention)
+
+pct_to_prop <- function(x) {
+  if (is.character(x)) x <- parse_number(x)
+  if (isTRUE(max(x, na.rm = TRUE) > 1)) x <- x / 100
+  x
+}
+
+hs_grad_rates<- hs_grad_rates|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+student_achievement <- student_achievement |> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+teacher_retention   <- teacher_retention|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+```
+
+Missing Data from retention and achievement data
+
+|              |        |
+|:-------------|-------:|
+| STU_PART_PCT | 704493 |
+
+|                  |     |
+|:-----------------|----:|
+| AVG_SCALED_SCORE | 101 |
+
+|         |         |
+|:--------|--------:|
+| AVG_SGP | 1093024 |
+
+|              |        |
+|:-------------|-------:|
+| AVG_SGP_INCL | 720605 |
+
+|                |        |
+|:---------------|-------:|
+| ACH_PERCENTILE | 962886 |
+
+|           |     |
+|:----------|----:|
+| RETND_PCT | 967 |
+
+|          |       |
+|:---------|------:|
+| COMMENTS | 87341 |
+
+|         |     |
+|:--------|----:|
+| TOT_CNT | 971 |
+
+|           |     |
+|:----------|----:|
+| RETND_CNT | 971 |
+
+Planned EDA plots:
+
+1.  look at hs grad rate, student achievement, and teacher retention at state level over time and the distribution of these in a specific year for each district
+
+    1.  how does retention pct depend on staff desc. does retention change over time
+
+2.  look at how student group interplays with grad rate
+
+```{r}
+#| label: EDA
+
+hs_grad_rates |>
+  filter(DIST_NAME == "State",
+         GRAD_RATE_TYPE == "4-Year Graduation Rate",
+         STU_GRP == "All Students") |>
+  ggplot(aes(x = SY, y  = GRAD_PCT)) +
+  geom_point() +
+  labs(title = "4 Year Grad Rate in MA from 2006 to 2025",
+        x = "school year",
+        y = "4 year graduation rate")
+  
+student_achievement |>
+  filter(DIST_NAME == "State",
+         STU_GRP == "All Students",
+         TEST_GRADE == "ALL (03-08)") |>
+  ggplot(aes(x = SY, y = M_PLUS_E_PCT, color = SUBJECT_CODE, group = SUBJECT_CODE)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Student Achievement in MA from 2017 to 2026",
+       x = "school year",
+       y = "meeting expectations and exceeeding expec.% ",
+       color = "Subject")
+
+teacher_retention |>
+  filter(DIST_NAME == "State Totals Unduplicated") |>
+  ggplot(aes(x = SY, y = RETND_PCT , color = STAFF_DESC, group = STAFF_DESC)) +
+  geom_point() +
+  geom_line()+
+  labs(x = "school year",
+       y = "percent retained",
+       title = "Percent of School Staff Retained in MA from 2009-2026 - UNDUP")
+
+teacher_retention |>
+  filter(DIST_NAME == "State Totals Roll-Up") |>
+  ggplot(aes(x = SY, y = RETND_PCT , color = STAFF_DESC, group = STAFF_DESC)) +
+  geom_point() +
+  geom_line()+
+  labs(x = "school year",
+       y = "percent retained",
+       title = "Percent of School Staff Retained in MA from 2009-2026-ROLLUP")
+
+```
+
+```{r}
+
+#| label: extended-data-explore
+count(teacher_retention, ORG_TYPE, STAFF_DESC)
+count(student_achievement, ORG_TYPE)
+count(hs_grad_rates, GRAD_RATE_TYPE, SY) |> pivot_wider(names_from = GRAD_RATE_TYPE, values_from = n)
+sort(unique(student_achievement$STU_GRP))
+sort(unique(hs_grad_rates$STU_GRP))
+
+
+```
+
+```{r}
+#| label: build-panels
+
