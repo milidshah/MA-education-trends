@@ -1,0 +1,760 @@
+---
+title: "exploration"
+format: html
+---
+
+
+**Background Research**
+
+- high teacher turnover linked to lower student achievement and weakens structural support for student graduation
+
+  - impacts are worse in areas with higher poverty rates
+
+  - but turnover can be beneficial if they are being replaced with more qualified educators
+
+- chronic turnover can have worse implications by grade level. in high school, this could look like inconsistent academic advising and fewer staff to teacher required courses or electives.
+
+- primary drivers of teacher turnover:
+
+  - Lower pay, lack of administrative support, heavy testing/accountability pressures, and early-career or alternative-route gaps contribute to higher departure rates.
+
+- Defining adjusted graduation rate in MA:
+
+  - "tracks students who stayed in the *same* school or district for all four years (grades 9–12), helping measure how well a school serves its continuous, non-mobile student population."
+
+  - excludes late transfers
+
+- Use state totals unduplicated for teacher retention to see if MA is losing teachers generally from public education workforce.
+
+To what extent do school resources and student characteristics explain differences in Massachusetts high school graduation rates?
+
+- 4 year adjusted grad rate - per school - per year
+
+- stu_grp - race and gender
+
+- school type - org_type (public/charter)
+
+- subject_code - math/ela
+
+  - M_PLUS_E_PCT
+
+- stu_grp - low income, homeless, foster care
+
+- staff_desc - teachers
+
+- retnd_pct
+
+**Step 1: EDA**
+
+```{r}
+#| label: load-packages-and-data
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(tidymodels)
+library(readr)
+library(vroom)
+library(patchwork)
+library(knitr)
+library(rstatix)
+library(skimr)
+library(fixest)
+library(marginaleffects)
+
+code_cols <- cols(DIST_CODE = col_character(),
+                  ORG_CODE  = col_character(),
+                  SY        = col_integer())
+
+hs_grad_rates       <- read_csv("data/hs_grad_rates.csv",
+                                col_types = code_cols)  # 2006-2025
+student_achievement <- read_csv("data/student_achievement.csv",
+                                col_types = code_cols)  # 2017-2026
+teacher_retention   <- read_csv("data/teacher_retention.csv",
+                                col_types = code_cols)  # 2009-2026
+
+theme_set(theme_minimal(base_size = 10))
+
+snap_year <- 2024 # year for cross section snapshots
+```
+
+```{r}
+#| label: explore-data
+
+skim(hs_grad_rates)
+skim(student_achievement)
+skim(teacher_retention)
+
+pct_to_prop <- function(x) {
+  if (is.character(x)) x <- parse_number(x)
+  if (isTRUE(max(x, na.rm = TRUE) > 1)) x <- x / 100
+  x
+}
+
+hs_grad_rates<- hs_grad_rates|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+student_achievement <- student_achievement |> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+teacher_retention   <- teacher_retention|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+```
+
+Missing Data from retention and achievement data
+
+|              |        |
+|:-------------|-------:|
+| STU_PART_PCT | 704493 |
+
+|                  |     |
+|:-----------------|----:|
+| AVG_SCALED_SCORE | 101 |
+
+|         |         |
+|:--------|--------:|
+| AVG_SGP | 1093024 |
+
+|              |        |
+|:-------------|-------:|
+| AVG_SGP_INCL | 720605 |
+
+|                |        |
+|:---------------|-------:|
+| ACH_PERCENTILE | 962886 |
+
+|           |     |
+|:----------|----:|
+| RETND_PCT | 967 |
+
+|          |       |
+|:---------|------:|
+| COMMENTS | 87341 |
+
+|         |     |
+|:--------|----:|
+| TOT_CNT | 971 |
+
+|           |     |
+|:----------|----:|
+| RETND_CNT | 971 |
+
+Planned EDA plots:
+
+1.  look at hs grad rate, student achievement, and teacher retention at state level over time and the distribution of these in a specific year for each district
+
+    1.  how does retention pct depend on staff desc. does retention change over time
+
+2.  look at how student group interplays with grad rate
+
+```{r}
+#| label: EDA
+
+hs_grad_rates |>
+  filter(DIST_NAME == "State",
+         GRAD_RATE_TYPE == "4-Year Graduation Rate",
+         STU_GRP == "All Students") |>
+  ggplot(aes(x = SY, y  = GRAD_PCT)) +
+  geom_point() +
+  labs(title = "4 Year Grad Rate in MA from 2006 to 2025",
+        x = "school year",
+        y = "4 year graduation rate")
+  
+student_achievement |>
+  filter(DIST_NAME == "State",
+         STU_GRP == "All Students",
+         TEST_GRADE == "ALL (03-08)") |>
+  ggplot(aes(x = SY, y = M_PLUS_E_PCT, color = SUBJECT_CODE, group = SUBJECT_CODE)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Student Achievement in MA from 2017 to 2026",
+       x = "school year",
+       y = "meeting expectations and exceeeding expec.% ",
+       color = "Subject")
+
+teacher_retention |>
+  filter(DIST_NAME == "State Totals Unduplicated") |>
+  ggplot(aes(x = SY, y = RETND_PCT , color = STAFF_DESC, group = STAFF_DESC)) +
+  geom_point() +
+  geom_line()+
+  labs(x = "school year",
+       y = "percent retained",
+       title = "Percent of School Staff Retained in MA from 2009-2026 - UNDUP")
+
+teacher_retention |>
+  filter(DIST_NAME == "State Totals Roll-Up") |>
+  ggplot(aes(x = SY, y = RETND_PCT , color = STAFF_DESC, group = STAFF_DESC)) +
+  geom_point() +
+  geom_line()+
+  labs(x = "school year",
+       y = "percent retained",
+       title = "Percent of School Staff Retained in MA from 2009-2026-ROLLUP")
+
+```
+
+```{r}
+#| label: extended-data-explore
+count(teacher_retention, ORG_TYPE, STAFF_DESC)
+count(student_achievement, ORG_TYPE)
+count(hs_grad_rates, GRAD_RATE_TYPE, SY) |> pivot_wider(names_from = GRAD_RATE_TYPE, values_from = n)
+sort(unique(student_achievement$STU_GRP))
+sort(unique(hs_grad_rates$STU_GRP))
+```
+
+```{r}
+#| label: build-panels
+
+# Graduation rate type used everywhere below (matches your state plot).
+# Switch to "4-Year Adjusted Cohort Graduation Rate" to use the adjusted rate.
+grad_type <- "4-Year Graduation Rate"
+
+# Shaded band for the COVID years, reused in the time-series plots
+covid <- annotate("rect", xmin = 2019.5, xmax = 2021.5,
+                  ymin = -Inf, ymax = Inf, alpha = .12)
+
+# 1a. Teachers and principals at the school level, one row per school-year
+ret_school <- teacher_retention |>
+  filter(ORG_TYPE == "School", STAFF_DESC %in% c("Teachers", "Principals")) |>
+  mutate(staff = if_else(STAFF_DESC == "Teachers", "teach", "princ")) |>
+  select(SY, DIST_CODE, DIST_NAME, ORG_CODE, ORG_NAME, staff,
+         TOT_CNT, RETND_CNT, RETND_PCT) |>
+  pivot_wider(names_from = staff, values_from = c(TOT_CNT, RETND_CNT, RETND_PCT)) |>
+  rename(teach_n = TOT_CNT_teach, teach_ret_n = RETND_CNT_teach, teach_ret = RETND_PCT_teach,
+         princ_n = TOT_CNT_princ, princ_ret_n = RETND_CNT_princ, princ_ret = RETND_PCT_princ) |>
+  mutate(princ_left = if_else(princ_n > 0, as.integer(princ_ret_n < princ_n), NA_integer_),
+         sector     = if_else(str_detect(DIST_NAME, regex("charter", ignore_case = TRUE)),
+                              "Charter", "District"))
+
+# Lags, lead, and 4-year average of teacher retention.
+# Retention in SY t = in the job in t-1 and still there in t.
+# complete() fills in missing years so lag() really means "previous year".
+ret_school <- ret_school |>
+  group_by(ORG_CODE) |>
+  complete(SY = full_seq(SY, 1)) |>
+  arrange(SY, .by_group = TRUE) |>
+  mutate(teach_ret_lag1  = lag(teach_ret),
+         teach_ret_lead1 = lead(teach_ret),
+         teach_ret_4yr   = (teach_ret + lag(teach_ret) + lag(teach_ret, 2) + lag(teach_ret, 3)) / 4) |>
+  ungroup() |>
+  filter(!is.na(DIST_CODE))   # drop the filler rows complete() added
+
+# 1b. MCAS: all students, ELA + Math, grades 3-8 combined and grade 10
+mcas_sy <- student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         STU_GRP == "All Students",
+         SUBJECT_CODE %in% c("ELA", "MATH"),
+         TEST_GRADE %in% c("ALL (03-08)", "10")) |>
+  mutate(band = if_else(TEST_GRADE == "10", "Grade 10", "Grades 3-8")) |>
+  group_by(SY, ORG_CODE, band) |>                     # average ELA and Math
+  summarise(me_pct = mean(M_PLUS_E_PCT, na.rm = TRUE),
+            sgp    = mean(AVG_SGP,      na.rm = TRUE), .groups = "drop") |>
+  mutate(across(c(me_pct, sgp), ~ if_else(is.nan(.x), NA_real_, .x)))
+
+# 1c. Share of economically disadvantaged students, from MCAS student counts.
+# Check the group labels printed in extended-data-explore; DESE renamed this
+# group around 2022. Groups under 10 students are suppressed (NA).
+econ_grps <- c("Economically Disadvantaged", "Low Income")
+
+demo <- student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         SUBJECT_CODE == "ELA", TEST_GRADE %in% c("ALL (03-08)", "10"),
+         STU_GRP %in% c("All Students", econ_grps)) |>
+  group_by(SY, ORG_CODE, STU_GRP) |>
+  summarise(n = sum(STU_CNT), .groups = "drop") |>
+  group_by(SY, ORG_CODE) |>
+  summarise(all_n  = sum(n[STU_GRP == "All Students"]),
+            econ_n = if (any(STU_GRP %in% econ_grps)) max(n[STU_GRP %in% econ_grps]) else NA_real_,
+            .groups = "drop") |>
+  mutate(econ_share = if_else(all_n > 0, econ_n / all_n, NA_real_))
+
+# 1d. Pre-COVID (2017-2019) achievement and poverty terciles for each school
+baseline <- mcas_sy |>
+  filter(SY %in% 2017:2019) |>
+  group_by(ORG_CODE) |>
+  summarise(base_me = mean(me_pct, na.rm = TRUE)) |>
+  left_join(demo |> filter(SY %in% 2017:2019) |>
+              group_by(ORG_CODE) |>
+              summarise(base_econ = mean(econ_share, na.rm = TRUE)),
+            by = "ORG_CODE") |>
+  mutate(across(c(base_me, base_econ), ~ if_else(is.nan(.x), NA_real_, .x)),
+         ach_tercile  = factor(ntile(base_me, 3),
+                               labels = c("Low achieving", "Middle", "High achieving")),
+         econ_tercile = factor(ntile(base_econ, 3),
+                               labels = c("Low poverty", "Middle", "High poverty")))
+
+# 1e. Graduation at the school level, all students
+grad_school <- hs_grad_rates |>
+  filter(ORG_TYPE == "School", STU_GRP == "All Students",
+         GRAD_RATE_TYPE == grad_type) |>
+  transmute(SY, ORG_CODE, cohort_n = COHORT_CNT, grad = GRAD_PCT,
+            still_in = IN_SCH_PCT, non_grad = NON_GRAD_PCT, ged = GED_PCT,
+            dropout = DRPOUT_PCT, excluded = EXCLUD_PCT)
+
+# 1f. Master school-year panel
+panel <- ret_school |>
+  left_join(baseline, by = "ORG_CODE") |>
+  left_join(demo |> select(SY, ORG_CODE, econ_share), by = c("SY", "ORG_CODE"))
+```
+
+```{r}
+#| label: coverage-and-summary-stats
+
+# How many schools appear in each dataset each year, and how many link up?
+coverage <- full_join(
+  ret_school |> filter(!is.na(teach_ret)) |> distinct(SY, ORG_CODE) |> mutate(ret = 1),
+  mcas_sy |> distinct(SY, ORG_CODE) |> mutate(mcas = 1), by = c("SY", "ORG_CODE")) |>
+  full_join(grad_school |> distinct(SY, ORG_CODE) |> mutate(grad = 1), by = c("SY", "ORG_CODE")) |>
+  group_by(SY) |>
+  summarise(retention    = sum(ret,  na.rm = TRUE),
+            mcas         = sum(mcas, na.rm = TRUE),
+            grad         = sum(grad, na.rm = TRUE),
+            ret_and_mcas = sum(ret & mcas, na.rm = TRUE),
+            ret_and_grad = sum(ret & grad, na.rm = TRUE))
+
+kable(coverage, caption = "Schools per year in each dataset")
+
+# Summary statistics for school-years from 2017 on, by sector
+panel |>
+  filter(SY >= 2017) |>
+  left_join(mcas_sy |> filter(band == "Grades 3-8") |> select(SY, ORG_CODE, me_pct, sgp),
+            by = c("SY", "ORG_CODE")) |>
+  left_join(grad_school |> select(SY, ORG_CODE, grad), by = c("SY", "ORG_CODE")) |>
+  select(sector, `Teachers (n)` = teach_n, `Teacher retention` = teach_ret,
+         `Principal left` = princ_left, `Econ. disadv. share` = econ_share,
+         `% Meet/Exceed (3-8)` = me_pct, `SGP (3-8)` = sgp, `Grad rate` = grad) |>
+  pivot_longer(-sector) |>
+  filter(!is.na(value)) |>
+  group_by(Variable = name, sector) |>
+  summarise(N = n(), Mean = mean(value), SD = sd(value),
+            P10 = quantile(value, .1), Median = median(value), P90 = quantile(value, .9),
+            .groups = "drop") |>
+  kable(digits = 2, caption = "School-year summary statistics, 2017 onward")
+```
+
+```{r}
+#| label: state-trends-and-district-distributions
+#| fig-height: 8
+
+p_ret <- teacher_retention |>
+  filter(DIST_NAME == "State Totals Unduplicated") |>
+  ggplot(aes(x = SY, y = RETND_PCT, color = STAFF_DESC)) +
+  covid + geom_point() + geom_line() +
+  labs(title = "Staff retained (state, unduplicated)", x = NULL, y = "percent retained", color = NULL)
+
+p_grad <- hs_grad_rates |>
+  filter(DIST_NAME == "State", STU_GRP == "All Students",
+         GRAD_RATE_TYPE %in% c("4-Year Graduation Rate", "5-Year Graduation Rate")) |>
+  ggplot(aes(x = SY, y = GRAD_PCT, color = GRAD_RATE_TYPE)) +
+  covid + geom_point() + geom_line() +
+  labs(title = "Graduation rate (state)", x = NULL, y = "graduation rate", color = NULL)
+
+p_mcas <- student_achievement |>
+  filter(DIST_NAME == "State", STU_GRP == "All Students",
+         SUBJECT_CODE %in% c("ELA", "MATH"), TEST_GRADE %in% c("ALL (03-08)", "10")) |>
+  ggplot(aes(x = SY, y = M_PLUS_E_PCT, color = SUBJECT_CODE, linetype = TEST_GRADE)) +
+  covid + geom_point() + geom_line() +
+  labs(title = "Meeting + exceeding expectations (state)", x = "school year",
+       y = "M+E %", color = "Subject", linetype = "Grade")
+
+p_ret / p_grad / p_mcas
+```
+
+```{r}
+#| label: district-distributions
+
+d_ret <- teacher_retention |>
+  filter(ORG_TYPE == "District", STAFF_DESC == "Teachers", SY == snap_year)
+
+d_grad <- hs_grad_rates |>
+  filter(ORG_TYPE == "District", STU_GRP == "All Students",
+         GRAD_RATE_TYPE == grad_type, SY == min(snap_year, 2025))
+
+d_mcas <- student_achievement |>
+  filter(ORG_TYPE %in% c("Public School District", "Charter District"),
+         STU_GRP == "All Students", SUBJECT_CODE %in% c("ELA", "MATH"),
+         TEST_GRADE == "ALL (03-08)", SY == snap_year)
+
+(ggplot(d_ret, aes(RETND_PCT)) + geom_histogram(bins = 30) +
+    labs(title = "Teacher retention", x = NULL)) +
+  (ggplot(d_grad, aes(GRAD_PCT)) + geom_histogram(bins = 30) +
+     labs(title = "Graduation rate", x = NULL)) +
+  (ggplot(d_mcas, aes(M_PLUS_E_PCT, fill = SUBJECT_CODE)) +
+     geom_histogram(bins = 30, alpha = .6, position = "identity") +
+     labs(title = "M+E % (grades 3-8)", x = NULL, fill = NULL)) +
+  plot_annotation(title = paste("Distributions across districts,", snap_year))
+```
+
+```{r}
+#| label: retention-by-staff-and-level
+
+# District level counts moves between schools in the district as retained;
+# school level does not. Expect the district line to sit above the school line.
+teacher_retention |>
+  filter(ORG_TYPE %in% c("School", "District")) |>
+  group_by(SY, ORG_TYPE, STAFF_DESC) |>
+  summarise(mean_ret = mean(RETND_PCT, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = SY, y = mean_ret, color = ORG_TYPE)) +
+  covid + geom_point() + geom_line() +
+  facet_wrap(~STAFF_DESC) +
+  labs(title = "Average retention by staff type and level",
+       x = "school year", y = "mean percent retained", color = "Level")
+
+# Small schools produce extreme rates by chance (funnel shape)
+panel |>
+  filter(SY == snap_year, !is.na(teach_ret)) |>
+  ggplot(aes(x = teach_n, y = teach_ret)) +
+  geom_point(alpha = .3) + scale_x_log10() +
+  labs(title = paste("School teacher retention vs. number of teachers,", snap_year),
+       x = "teachers (log scale)", y = "percent retained")
+```
+
+```{r}
+#| label: turnover-type-decomposition
+
+# school - district = moved within district; district - state = moved between
+# districts; 1 - state = left the role in MA public schools.
+# Uses counts at each level so the three rates share the same definition of
+# "teachers"; check that District >= School every year.
+teacher_retention |>
+  filter(STAFF_DESC == "Teachers",
+         ORG_TYPE %in% c("School", "District") | DIST_NAME == "State Totals Unduplicated") |>
+  mutate(level = if_else(ORG_TYPE %in% c("School", "District"), ORG_TYPE, "State")) |>
+  group_by(SY, level) |>
+  summarise(rate = sum(RETND_CNT, na.rm = TRUE) / sum(TOT_CNT, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = level, values_from = rate) |>
+  transmute(SY,
+            `Moved within district`         = District - School,
+            `Moved between districts`       = State - District,
+            `Left role / MA public schools` = 1 - State) |>
+  pivot_longer(-SY) |>
+  ggplot(aes(x = SY, y = value, fill = name)) + geom_area() +
+  labs(title = "Teacher turnover by type", x = "school year", y = "share of teachers", fill = NULL)
+```
+
+```{r}
+#| label: grad-by-student-group
+
+# Edit to match the labels printed in extended-data-explore
+grp_keep <- c("All Students", "Low Income", "Economically Disadvantaged", "High Needs",
+              "Students with Disabilities", "English Learners",
+              "Black or African American", "Hispanic or Latino", "White", "Asian")
+
+hs_grad_rates |>
+  filter(DIST_NAME == "State", STU_GRP %in% grp_keep, GRAD_RATE_TYPE == grad_type) |>
+  ggplot(aes(x = SY, y = GRAD_PCT, color = STU_GRP)) +
+  covid + geom_point() + geom_line() +
+  labs(title = "Graduation rate by student group (state)",
+       x = "school year", y = "graduation rate", color = NULL)
+
+# Within-school gap: econ. disadvantaged minus all students,
+# by quintile of teacher retention over the cohort's 4 years
+grad_gap <- hs_grad_rates |>
+  filter(ORG_TYPE == "School", GRAD_RATE_TYPE == grad_type,
+         STU_GRP %in% c("All Students", econ_grps)) |>
+  mutate(grp = if_else(STU_GRP == "All Students", "all", "econ")) |>
+  group_by(SY, ORG_CODE, grp) |>
+  summarise(grad = mean(GRAD_PCT), .groups = "drop") |>
+  pivot_wider(names_from = grp, values_from = grad) |>
+  mutate(gap = econ - all) |>
+  inner_join(panel |> select(SY, ORG_CODE, teach_ret_4yr), by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(gap), !is.na(teach_ret_4yr)) |>
+  mutate(ret_q = factor(ntile(teach_ret_4yr, 5)))
+
+grad_gap |>
+  group_by(ret_q) |>
+  summarise(mean_gap = mean(gap), se = sd(gap) / sqrt(n()), n = n()) |>
+  ggplot(aes(x = ret_q, y = mean_gap)) +
+  geom_pointrange(aes(ymin = mean_gap - 1.96 * se, ymax = mean_gap + 1.96 * se)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(title = "Econ. disadvantaged minus all-student grad rate",
+       x = "4-yr teacher retention quintile (1 = lowest)", y = "gap")
+```
+
+```{r}
+#| label: variance-and-persistence
+
+vd <- panel |>
+  filter(!is.na(teach_ret)) |>
+  group_by(ORG_CODE) |> mutate(school_mean = mean(teach_ret)) |> ungroup() |>
+  group_by(DIST_CODE) |> mutate(dist_mean = mean(teach_ret)) |> ungroup() |>
+  group_by(SY) |> mutate(year_mean = mean(teach_ret)) |> ungroup()
+
+tibble(
+  component = c("Total variance", "Between districts", "Between schools (persistent)",
+                "Within school over time", "Statewide year-to-year"),
+  variance  = c(var(vd$teach_ret), var(vd$dist_mean), var(vd$school_mean),
+                var(vd$teach_ret - vd$school_mean), var(vd$year_mean))) |>
+  mutate(share_of_total = variance / variance[1]) |>
+  kable(digits = 4, caption = "Variance of school teacher retention (shares overlap, not additive)")
+
+# This year vs. last year
+pers <- panel |> filter(!is.na(teach_ret), !is.na(teach_ret_lag1))
+cat("Year-to-year correlation of school teacher retention:",
+    round(cor(pers$teach_ret, pers$teach_ret_lag1), 2), "\n")
+
+ggplot(pers, aes(x = teach_ret_lag1, y = teach_ret)) +
+  geom_bin2d(bins = 40) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  scale_fill_viridis_c(trans = "log10") +
+  labs(title = "Teacher retention: this year vs. last year",
+       x = "last year", y = "this year")
+
+# Transition matrix of within-year quintiles
+trans <- panel |>
+  filter(!is.na(teach_ret)) |>
+  group_by(SY) |> mutate(q = ntile(teach_ret, 5)) |> ungroup() |>
+  arrange(ORG_CODE, SY) |>
+  group_by(ORG_CODE) |>
+  mutate(q_prev = if_else(lag(SY) == SY - 1, lag(q), NA_integer_)) |>
+  ungroup() |>
+  filter(!is.na(q_prev)) |>
+  count(q_prev, q) |>
+  group_by(q_prev) |> mutate(p = n / sum(n)) |> ungroup()
+
+ggplot(trans, aes(x = factor(q), y = factor(q_prev), fill = p)) +
+  geom_tile() + geom_text(aes(label = round(p, 2)), size = 3) +
+  scale_fill_viridis_c() +
+  labs(title = "Retention quintile transitions (1 = lowest retention)",
+       x = "quintile this year", y = "quintile last year", fill = "share")
+```
+
+```{r}
+#| label: chronic-vs-episodic
+
+# High-turnover year = school is in the bottom 20% of teacher retention that year
+chronic <- panel |>
+  filter(!is.na(teach_ret)) |>
+  group_by(SY) |> mutate(high_turn = teach_ret <= quantile(teach_ret, .2)) |> ungroup() |>
+  group_by(ORG_CODE, sector) |>
+  summarise(years = n(), share_high = mean(high_turn),
+            base_me = first(base_me), base_econ = first(base_econ),
+            exits = sum(teach_n - teach_ret_n, na.rm = TRUE),
+            teacher_years = sum(teach_n, na.rm = TRUE), .groups = "drop") |>
+  filter(years >= 5) |>
+  mutate(type = case_when(share_high == 0 ~ "Stable",
+                          share_high < .5 ~ "Episodic",
+                          TRUE            ~ "Chronic") |>
+           factor(levels = c("Stable", "Episodic", "Chronic")))
+
+school_outcomes <- mcas_sy |>
+  filter(band == "Grades 3-8") |>
+  group_by(ORG_CODE) |>
+  summarise(mean_sgp = mean(sgp, na.rm = TRUE), mean_me = mean(me_pct, na.rm = TRUE)) |>
+  full_join(grad_school |> group_by(ORG_CODE) |> summarise(mean_grad = mean(grad)),
+            by = "ORG_CODE")
+
+chronic |>
+  left_join(school_outcomes, by = "ORG_CODE") |>
+  group_by(type) |>
+  summarise(schools = n(), charter_share = mean(sector == "Charter"),
+            econ_share    = mean(base_econ, na.rm = TRUE),
+            `M+E % (3-8)` = mean(mean_me,  na.rm = TRUE),
+            `SGP (3-8)`   = mean(mean_sgp, na.rm = TRUE),
+            `Grad rate`   = mean(mean_grad, na.rm = TRUE)) |>
+  kable(digits = 2, caption = "Schools by turnover pattern")
+
+# Concentration: share of all exits coming from the highest-turnover schools
+lorenz <- chronic |>
+  mutate(exit_rate = exits / teacher_years) |>
+  arrange(desc(exit_rate)) |>
+  mutate(cum_teachers = cumsum(teacher_years) / sum(teacher_years),
+         cum_exits    = cumsum(exits) / sum(exits))
+
+ggplot(lorenz, aes(x = cum_teachers, y = cum_exits)) +
+  geom_line() + geom_abline(linetype = 2) +
+  labs(title = "Concentration of teacher exits",
+       subtitle = "Schools ordered from highest to lowest exit rate",
+       x = "cumulative share of teacher-years", y = "cumulative share of exits")
+```
+
+```{r}
+#| label: covid-by-school-type
+#| fig-height: 8
+
+# Mean school teacher retention by year for each group
+plot_by_group <- function(var, title) {
+  panel |>
+    filter(!is.na({{ var }})) |>
+    group_by(SY, grp = {{ var }}) |>
+    summarise(mean_ret = mean(teach_ret, na.rm = TRUE), .groups = "drop") |>
+    ggplot(aes(x = SY, y = mean_ret, color = grp)) +
+    covid + geom_point() + geom_line() +
+    labs(title = title, x = NULL, y = "mean teacher retention", color = NULL)
+}
+
+plot_by_group(ach_tercile,  "By 2017-19 achievement tercile") /
+  plot_by_group(econ_tercile, "By 2017-19 poverty tercile") /
+  plot_by_group(sector,       "By sector")
+
+# Gap between high- and low-achieving schools over time
+panel |>
+  filter(!is.na(ach_tercile)) |>
+  group_by(SY, ach_tercile) |>
+  summarise(mean_ret = mean(teach_ret, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = ach_tercile, values_from = mean_ret) |>
+  mutate(gap = `High achieving` - `Low achieving`) |>
+  ggplot(aes(x = SY, y = gap)) +
+  covid + geom_point() + geom_line() +
+  labs(title = "Retention gap: high- minus low-achieving schools",
+       x = "school year", y = "gap")
+```
+
+```{r}
+#| label: levels-vs-growth
+
+# Remove school and year means by alternating demeaning (= two-way fixed
+# effects once it converges)
+demean2 <- function(v, g1, g2, iter = 20) {
+  for (i in seq_len(iter)) {
+    v <- v - ave(v, g1)
+    v <- v - ave(v, g2)
+  }
+  v
+}
+
+# Bin x into n equal-sized groups; average x and y in each bin
+binscatter_data <- function(df, x, y, n = 20) {
+  df |>
+    mutate(bin = ntile({{ x }}, n)) |>
+    group_by(bin) |>
+    summarise(x = mean({{ x }}), y = mean({{ y }}), .groups = "drop")
+}
+
+ach <- panel |>
+  filter(!is.na(teach_ret)) |>
+  inner_join(mcas_sy, by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(me_pct), !is.na(sgp))
+
+bins <- map_dfr(c("Grades 3-8", "Grade 10"), function(b) {
+  d <- ach |> filter(band == b)
+  versions <- list(
+    "1. Raw" =
+      d |> mutate(xr = teach_ret, me = me_pct, gr = sgp),
+    "2. Year-demeaned" =
+      d |> mutate(xr = teach_ret - ave(teach_ret, SY),
+                  me = me_pct - ave(me_pct, SY),
+                  gr = sgp - ave(sgp, SY)),
+    "3. School + year demeaned" =
+      d |> mutate(xr = demean2(teach_ret, ORG_CODE, SY),
+                  me = demean2(me_pct, ORG_CODE, SY),
+                  gr = demean2(sgp, ORG_CODE, SY)))
+  imap_dfr(versions, function(dd, v)
+    bind_rows(binscatter_data(dd, xr, me) |> mutate(outcome = "M+E % (level)"),
+              binscatter_data(dd, xr, gr) |> mutate(outcome = "SGP (growth)")) |>
+      mutate(version = v, band = b))
+})
+
+ggplot(bins, aes(x = x, y = y, color = band)) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(outcome ~ version, scales = "free") +
+  labs(title = "Teacher retention vs. achievement level and growth",
+       x = "teacher retention", y = NULL, color = NULL)
+
+ach |>
+  group_by(band) |>
+  summarise(`Level, raw`             = cor(teach_ret, me_pct),
+            `Growth, raw`            = cor(teach_ret, sgp),
+            `Level, school+year FE`  = cor(demean2(teach_ret, ORG_CODE, SY), demean2(me_pct, ORG_CODE, SY)),
+            `Growth, school+year FE` = cor(demean2(teach_ret, ORG_CODE, SY), demean2(sgp, ORG_CODE, SY))) |>
+  kable(digits = 2, caption = "Correlation of teacher retention with achievement")
+```
+
+```{r}
+#| label: charter-vs-district
+
+panel |>
+  filter(SY %in% c(2012, 2019, 2022, snap_year)) |>
+  ggplot(aes(x = teach_ret, fill = sector)) +
+  geom_density(alpha = .5) + facet_wrap(~SY) +
+  labs(title = "School teacher retention by sector", x = "percent retained", fill = NULL)
+
+ach |>
+  filter(band == "Grades 3-8") |>
+  mutate(xr = teach_ret - ave(teach_ret, SY), gr = sgp - ave(sgp, SY)) |>
+  group_by(sector) |>
+  group_modify(~ binscatter_data(.x, xr, gr, n = 15)) |>
+  ggplot(aes(x = x, y = y, color = sector)) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Teacher retention vs. SGP by sector (year-demeaned)",
+       x = "teacher retention", y = "SGP", color = NULL)
+```
+
+```{r}
+#| label: principal-turnover
+
+# Next year's teacher retention by whether the principal left this year
+panel |>
+  filter(!is.na(princ_left), !is.na(teach_ret_lead1)) |>
+  group_by(econ_tercile, princ_left) |>
+  summarise(next_yr_ret = mean(teach_ret_lead1), n = n(), .groups = "drop") |>
+  kable(digits = 3, caption = "Next-year teacher retention by principal departure")
+
+# Each school's first principal departure that follows 2 years with no departure
+events <- panel |>
+  arrange(ORG_CODE, SY) |>
+  group_by(ORG_CODE) |>
+  mutate(clean = princ_left == 1 & lag(princ_left) == 0 & lag(princ_left, 2) == 0) |>
+  filter(clean %in% TRUE) |>
+  summarise(event_year = min(SY))
+
+panel |>
+  filter(!is.na(teach_ret)) |>
+  group_by(SY) |> mutate(ret_dm = teach_ret - mean(teach_ret)) |> ungroup() |>  # remove year effects
+  inner_join(events, by = "ORG_CODE") |>
+  mutate(event_time = SY - event_year) |>
+  filter(between(event_time, -3, 3)) |>
+  group_by(event_time) |>
+  summarise(m = mean(ret_dm), se = sd(ret_dm) / sqrt(n()), n = n()) |>
+  ggplot(aes(x = event_time, y = m)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_vline(xintercept = -0.5, color = "grey50") +
+  geom_pointrange(aes(ymin = m - 1.96 * se, ymax = m + 1.96 * se)) +
+  labs(title = "Teacher retention around a principal departure",
+       subtitle = "Relative to the statewide school mean that year; 95% CIs",
+       x = "years since principal departure", y = "teacher retention vs. year mean")
+```
+
+```{r}
+#| label: grad-outcomes-by-turnover
+
+grad_turn <- grad_school |>
+  inner_join(panel |> select(SY, ORG_CODE, teach_ret_4yr, sector),
+             by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(teach_ret_4yr)) |>
+  group_by(SY) |> mutate(ret_q = factor(ntile(teach_ret_4yr, 5))) |> ungroup()
+
+# What happens to students who don't graduate?
+grad_turn |>
+  group_by(ret_q) |>
+  summarise(across(c(still_in, non_grad, ged, dropout, excluded), ~ mean(.x, na.rm = TRUE))) |>
+  pivot_longer(-ret_q) |>
+  mutate(name = factor(name, levels = c("excluded", "ged", "non_grad", "still_in", "dropout"))) |>
+  ggplot(aes(x = ret_q, y = value, fill = name)) + geom_col() +
+  labs(title = "Non-graduation outcomes by 4-yr teacher retention quintile",
+       x = "teacher retention quintile (1 = lowest)", y = "share of cohort", fill = NULL)
+
+# Grad rate vs. 4-year teacher retention, raw and year-demeaned
+bind_rows(
+  binscatter_data(grad_turn, teach_ret_4yr, grad) |> mutate(version = "Raw"),
+  grad_turn |>
+    mutate(xr = teach_ret_4yr - ave(teach_ret_4yr, SY), gr = grad - ave(grad, SY)) |>
+    binscatter_data(xr, gr) |> mutate(version = "Year-demeaned")) |>
+  ggplot(aes(x = x, y = y)) +
+  geom_point() + geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~version, scales = "free") +
+  labs(title = "Graduation rate vs. teacher retention over the cohort's 4 years",
+       x = "teacher retention (4-yr avg)", y = "graduation rate")
+```
+
+```{r}
+#| label: correlation-matrix
+
+panel |>
+  left_join(mcas_sy |> filter(band == "Grades 3-8") |> select(SY, ORG_CODE, me_pct, sgp),
+            by = c("SY", "ORG_CODE")) |>
+  left_join(grad_school |> select(SY, ORG_CODE, grad, dropout), by = c("SY", "ORG_CODE")) |>
+  select(teach_ret, princ_left, econ_share, me_pct, sgp, grad, dropout) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(2) |>
+  kable(caption = "Pairwise correlations (school-years)")
+```

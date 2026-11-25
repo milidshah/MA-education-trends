@@ -1,0 +1,635 @@
+---
+title: "Massachusetts Education Data Analysis"
+author: "Mili Shah"
+format: pdf
+editor: visual
+---
+
+**To what extent do school resources (teacher retention and per-pupil spending) explain differences in Massachusetts high school graduation rates, beyond student characteristics? And does leadership disruption causally affect graduation?**
+
+2017 -2025
+
+1.  Descriptive: School Resources model -\> how much do resources explain grad rate
+    1.  controls are student charcteristrics
+    2.  look into teacher retention and per pupil spending
+2.  Interaction: does teacher retention vary according to poverty?
+3.  Causal: does principal's departure affect graduation rate?
+
+```{r}
+#| label: load-packages-and-data
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(skimr)
+library(fixest)
+library(marginaleffects)
+
+code_cols <- cols(DIST_CODE = col_character(),
+                  ORG_CODE  = col_character(),
+                  SY        = col_integer())
+
+hs_grad_rates       <- read_csv("data/hs_grad_rates.csv",
+                                col_types = code_cols)  # 2006-2025
+student_achievement <- read_csv("data/student_achievement.csv",
+                                col_types = code_cols)  # 2017-2026
+teacher_retention   <- read_csv("data/teacher_retention.csv",
+                                col_types = code_cols)  # 2009-2026
+
+theme_set(theme_minimal(base_size = 10))
+
+snap_year <- 2024 # year for cross section snapshots
+```
+
+```{r}
+#| label: explore-data
+
+skim(hs_grad_rates)
+skim(student_achievement)
+skim(teacher_retention)
+
+pct_to_prop <- function(x) {
+  if (is.character(x)) x <- parse_number(x)
+  if (isTRUE(max(x, na.rm = TRUE) > 1)) x <- x / 100
+  x
+}
+
+hs_grad_rates<- hs_grad_rates|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+student_achievement <- student_achievement |> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+
+teacher_retention   <- teacher_retention|> 
+  mutate(across(ends_with("_PCT"), pct_to_prop))
+```
+
+**EDA to motivate models**
+
+```{r}
+#| label: eda-response
+
+# Response variables: graduation rate and math/ELA achievement
+p_grad <- hs_grad_rates |>
+  filter(ORG_TYPE == "School", STU_GRP == "All Students",
+         GRAD_RATE_TYPE == "4-Year Adjusted Cohort Graduation Rate",
+         SY >= 2017, COHORT_CNT >= 20) |>
+  ggplot(aes(x = GRAD_PCT)) +
+  geom_histogram(bins = 30) +
+  labs(title = "4-Year Adjusted Graduation Rate",
+       x = "graduation rate (school-cohort)", y = "count")
+
+p_grad_log <- hs_grad_rates |>
+  filter(ORG_TYPE == "School", STU_GRP == "All Students",
+         GRAD_RATE_TYPE == "4-Year Adjusted Cohort Graduation Rate",
+         SY >= 2017, COHORT_CNT >= 20) |>
+  ggplot(aes(x = log(GRAD_PCT))) +
+  geom_histogram(bins = 30) +
+  labs(title = "4-Year Adjusted Graduation Rate",
+       x = "log graduation rate (school-cohort)", y = "count")
+
+
+p_ach <- student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         STU_GRP == "All Students", TEST_GRADE == "ALL (03-08)",
+         SUBJECT_CODE %in% c("ELA", "MATH")) |>
+  ggplot(aes(x = M_PLUS_E_PCT, fill = SUBJECT_CODE)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Meeting/Exceeding Expectations (gr 3-8)",
+       x = "% meeting or exceeding (school-year)", fill = "subject")
+
+p_grad
+p_grad_log
+p_ach
+```
+
+```{r}
+#| label: eda-predictor
+
+# Key predictor: school teacher retention, by school type
+teacher_retention |>
+  filter(ORG_TYPE == "School", STAFF_DESC == "Teachers",
+         SY >= 2017, TOT_CNT >= 10) |>
+  mutate(school_type = if_else(str_detect(DIST_NAME, "Charter"), "Charter", "Public")) |>
+  ggplot(aes(x = RETND_PCT, fill = school_type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Teacher Retention by School Type",
+       x = "percent of teachers retained (school-year)", fill = "school type")
+```
+
+```{r}
+#| label: eda-controls
+
+# Controls: graduation rates differ sharply by student group
+hs_grad_rates |>
+  filter(ORG_TYPE == "School", SY >= 2017, COHORT_CNT >= 20,
+         GRAD_RATE_TYPE == "4-Year Adjusted Cohort Graduation Rate",
+         STU_GRP %in% c("All Students", "Low Income", "Homeless", "Foster Care",
+                        "Black or African American", "Hispanic or Latino",
+                        "White", "Male", "Female")) |>
+  ggplot(aes(x = GRAD_PCT, y = fct_reorder(STU_GRP, GRAD_PCT, .fun = median))) +
+  geom_boxplot() +
+  labs(title = "School Graduation Rates by Student Group",
+       x = "4-year adjusted graduation rate", y = NULL)
+```
+
+```{r}
+#| label: eda-interaction-grad
+
+# Interaction: retention vs. graduation, by school poverty level
+hs_grad_rates |>
+  filter(ORG_TYPE == "School", SY >= 2017,
+         GRAD_RATE_TYPE == "4-Year Adjusted Cohort Graduation Rate",
+         STU_GRP %in% c("All Students", "Low Income")) |>
+  select(SY, ORG_CODE, STU_GRP, GRAD_PCT, COHORT_CNT) |>
+  pivot_wider(names_from = STU_GRP, values_from = c(GRAD_PCT, COHORT_CNT)) |>
+  filter(`COHORT_CNT_All Students` >= 20) |>
+  mutate(low_inc_share = `COHORT_CNT_Low Income` / `COHORT_CNT_All Students`,
+         poverty = factor(ntile(low_inc_share, 3), labels = c("Low", "Mid", "High"))) |>
+  inner_join(teacher_retention |>
+               filter(ORG_TYPE == "School", STAFF_DESC == "Teachers", TOT_CNT >= 10) |>
+               select(SY, ORG_CODE, RETND_PCT),
+             by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(poverty)) |>
+  ggplot(aes(x = RETND_PCT, y = `GRAD_PCT_All Students`, color = poverty)) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Teacher Retention x Poverty: Graduation",
+       x = "percent of teachers retained", y = "4-year adjusted graduation rate",
+       color = "low-income share")
+```
+
+```{r}
+#| label: eda-interaction-ach
+
+# Interaction: retention vs. achievement growth, by school poverty level
+student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         TEST_GRADE == "ALL (03-08)", SUBJECT_CODE %in% c("ELA", "MATH"),
+         STU_GRP %in% c("All Students", "Low Income", "Economically Disadvantaged")) |>
+  group_by(SY, ORG_CODE, SUBJECT_CODE) |>
+  summarise(sgp           = AVG_SGP[STU_GRP == "All Students"][1],
+            low_inc_share = max(STU_CNT[STU_GRP != "All Students"], 0) /
+                            STU_CNT[STU_GRP == "All Students"][1],
+            .groups = "drop") |>
+  mutate(poverty = factor(ntile(low_inc_share, 3), labels = c("Low", "Mid", "High"))) |>
+  inner_join(teacher_retention |>
+               filter(ORG_TYPE == "School", STAFF_DESC == "Teachers", TOT_CNT >= 10) |>
+               select(SY, ORG_CODE, RETND_PCT),
+             by = c("SY", "ORG_CODE")) |>
+  ggplot(aes(x = RETND_PCT, y = sgp, color = poverty)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~SUBJECT_CODE) +
+  labs(title = "Teacher Retention x Poverty: Student Growth (gr 3-8)",
+       x = "percent of teachers retained", y = "average student growth percentile",
+       color = "low-income share")
+```
+
+```{r}
+#| label: eda-principal-event
+
+# Event: teacher retention in years with vs. without a principal departure
+teacher_retention |>
+  filter(ORG_TYPE == "School", STAFF_DESC %in% c("Teachers", "Principals"), SY >= 2017) |>
+  group_by(SY, ORG_CODE) |>
+  summarise(teach_ret  = RETND_PCT[STAFF_DESC == "Teachers"][1],
+            teach_n    = TOT_CNT[STAFF_DESC == "Teachers"][1],
+            princ_left = any(STAFF_DESC == "Principals" & RETND_PCT < 1),
+            .groups = "drop") |>
+  filter(teach_n >= 10) |>
+  mutate(princ_left = if_else(princ_left, "Principal left", "Principal stayed")) |>
+  ggplot(aes(x = factor(SY), y = teach_ret, fill = princ_left)) +
+  geom_boxplot(outlier.shape = NA) +
+  coord_cartesian(ylim = c(0.5, 1)) +
+  labs(title = "Teacher Retention When the Principal Leaves",
+       x = "school year", y = "percent of teachers retained", fill = NULL)
+```
+
+**Data Filtering for analysis**
+
+```{r}
+#| label: data filtering
+
+
+grad_type  <- "4-Year Adjusted Cohort Graduation Rate"
+
+# school level teacher and principal retention
+
+teacher_retention_clean <- teacher_retention |>
+  filter(ORG_TYPE == "School",
+         STAFF_DESC %in% c("Teachers", "Principals"),
+         SY>=2017, SY <=2025) |>
+  select(SY, DIST_NAME, ORG_CODE, STAFF_DESC, TOT_CNT, RETND_CNT, RETND_PCT) |>
+  pivot_wider(names_from = STAFF_DESC, 
+              values_from = c(TOT_CNT, RETND_CNT, RETND_PCT)) |>
+  transmute(SY, ORG_CODE,
+            sector= if_else(str_detect(DIST_NAME, regex("charter", 
+                                                        ignore_case = TRUE)),
+                                 "Charter", "District"),
+            teach_n    = TOT_CNT_Teachers,
+            teach_ret  = RETND_PCT_Teachers,
+            princ_left = if_else(TOT_CNT_Principals > 0,
+                                 as.integer(RETND_CNT_Teachers < TOT_CNT_Principals), NA_integer_))
+            
+
+
+# achievement sample: gr 3-8, ela and math, school
+student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         STU_GRP == "All Students")
+```
+
+```{r}
+#| label: clean-data
+#| message: false
+
+min_teach  <- 10   # schools with fewer teachers have very noisy retention rates
+min_cohort <- 20   # cohorts smaller than this have very noisy graduation rates
+grad_type  <- "4-Year Adjusted Cohort Graduation Rate"
+
+# ---- 1. Staff panel: one row per school-year --------------------------------
+# Retention in SY t = in the job in t-1 and still there in t.
+staff <- teacher_retention |>
+  filter(ORG_TYPE == "School", STAFF_DESC %in% c("Teachers", "Principals")) |>
+  group_by(SY, ORG_CODE) |>
+  summarise(charter    = as.integer(str_detect(first(DIST_NAME), "Charter")),
+            teach_n    = TOT_CNT[STAFF_DESC == "Teachers"][1],
+            teach_ret  = RETND_PCT[STAFF_DESC == "Teachers"][1],
+            princ_left = if (any(STAFF_DESC == "Principals"))
+                           as.integer(any(STAFF_DESC == "Principals" & RETND_CNT < TOT_CNT, na.rm = TRUE))
+                         else NA_integer_,
+            .groups = "drop") |>
+  # fill in missing years so lag() always means "previous year"
+  group_by(ORG_CODE) |>
+  complete(SY = full_seq(SY, 1)) |>
+  arrange(SY, .by_group = TRUE) |>
+  mutate(teach_ret_4yr = (teach_ret + lag(teach_ret) + lag(teach_ret, 2) + lag(teach_ret, 3)) / 4,
+         princ_dep_4yr = princ_left + lag(princ_left) + lag(princ_left, 2) + lag(princ_left, 3),
+         # a "clean" principal departure: principal left after 3 years with no departure
+         clean_dep     = princ_left == 1 & lag(princ_left) == 0 &
+                         lag(princ_left, 2) == 0 & lag(princ_left, 3) == 0) |>
+  ungroup() |>
+  filter(!is.na(charter))   # drop the filler rows complete() added
+
+# Event year for Model 3:
+#   first clean departure            -> that year
+#   never had a departure            -> 10000 (sunab's code for "never treated")
+#   had departures, none were clean  -> NA (dropped from the event study)
+events <- staff |>
+  group_by(ORG_CODE) |>
+  summarise(event_year = if (any(clean_dep %in% TRUE)) min(SY[clean_dep %in% TRUE])
+                         else if (all(princ_left %in% 0)) 10000
+                         else NA_real_)
+staff <- staff |> left_join(events, by = "ORG_CODE")
+
+# ---- 2. Achievement data: school-year-subject, grades 3-8 ------------------
+# Composition comes from MCAS student-group counts. DESE labels low income as
+# "Low Income" or "Economically Disadvantaged" depending on the year.
+# Suppressed (small) groups are missing, so they count as 0.
+ach <- student_achievement |>
+  filter(ORG_TYPE %in% c("Public School", "Charter School"),
+         TEST_GRADE == "ALL (03-08)", SUBJECT_CODE %in% c("ELA", "MATH"),
+         STU_GRP %in% c("All Students", "Low Income", "Economically Disadvantaged",
+                        "Black or African American", "Hispanic or Latino", "Male")) |>
+  group_by(SY, ORG_CODE, subject = SUBJECT_CODE) |>
+  summarise(stu_n     = STU_CNT[STU_GRP == "All Students"][1],
+            sgp       = AVG_SGP[STU_GRP == "All Students"][1],
+            me_pct    = M_PLUS_E_PCT[STU_GRP == "All Students"][1],
+            low_inc   = max(c(STU_CNT[STU_GRP %in% c("Low Income", "Economically Disadvantaged")], 0)) / stu_n,
+            black_his = sum(STU_CNT[STU_GRP %in% c("Black or African American", "Hispanic or Latino")]) / stu_n,
+            male      = sum(STU_CNT[STU_GRP == "Male"]) / stu_n,
+            .groups = "drop") |>
+  inner_join(staff, by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(stu_n), !is.na(sgp), !is.na(teach_ret), teach_n >= min_teach)
+
+# ---- 3. Graduation data: high school x cohort ------------------------------
+# Kept from 2013 for the event study; Models 1-2 use 2017+.
+grad <- hs_grad_rates |>
+  filter(ORG_TYPE == "School", GRAD_RATE_TYPE == grad_type, SY >= 2013) |>
+  group_by(SY, ORG_CODE) |>
+  summarise(cohort_n  = COHORT_CNT[STU_GRP == "All Students"][1],
+            grad      = GRAD_PCT[STU_GRP == "All Students"][1],
+            low_inc   = sum(COHORT_CNT[STU_GRP == "Low Income"]) / cohort_n,
+            black_his = sum(COHORT_CNT[STU_GRP %in% c("Black or African American", "Hispanic or Latino")]) / cohort_n,
+            male      = sum(COHORT_CNT[STU_GRP == "Male"]) / cohort_n,
+            hom_fos   = as.integer(any(STU_GRP %in% c("Homeless", "Foster Care"))),
+            .groups = "drop") |>
+  inner_join(staff, by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(cohort_n), cohort_n >= min_cohort, teach_n >= min_teach)
+
+# ---- 4. Model variables -----------------------------------------------------
+# Retention in 10-percentage-point units; low income and retention centered
+# before interacting (reduces collinearity in Model 2).
+ach <- ach |>
+  mutate(teach_ret10 = (teach_ret - mean(teach_ret)) * 10,
+         low_inc_c   = low_inc - mean(low_inc),
+         poverty     = factor(ntile(low_inc, 3), labels = c("Low", "Mid", "High")))
+
+grad_m <- grad |>                       # Models 1-2 sample
+  filter(SY >= 2017, !is.na(teach_ret_4yr), !is.na(princ_dep_4yr)) |>
+  mutate(teach_ret10_4yr = (teach_ret_4yr - mean(teach_ret_4yr)) * 10,
+         low_inc_c       = low_inc - mean(low_inc),
+         poverty         = factor(ntile(low_inc, 3), labels = c("Low", "Mid", "High")))
+
+# Event-study samples: treated schools within 4 years of their event, plus
+# never-treated schools
+es_window <- function(df) {
+  df |>
+    filter(!is.na(event_year)) |>
+    mutate(rel_time = if_else(event_year == 10000, NA_real_, SY - event_year)) |>
+    filter(is.na(rel_time) | between(rel_time, -4, 4))
+}
+es_staff <- staff |> filter(SY >= 2012, teach_n >= min_teach, !is.na(teach_ret)) |> es_window()
+es_grad  <- grad  |> es_window()
+es_ach   <- ach   |> es_window()
+
+# ---- 5. Sample sizes ----------------------------------------------------------
+tibble(dataset = c("Achievement (school-year-subject)", "Graduation, Models 1-2",
+                   "Event study: retention", "Event study: graduation"),
+       rows    = c(nrow(ach), nrow(grad_m), nrow(es_staff), nrow(es_grad)),
+       schools = c(n_distinct(ach$ORG_CODE), n_distinct(grad_m$ORG_CODE),
+                   n_distinct(es_staff$ORG_CODE), n_distinct(es_grad$ORG_CODE)),
+       treated_schools = c(NA, NA,
+                           n_distinct(es_staff$ORG_CODE[es_staff$event_year < 10000]),
+                           n_distinct(es_grad$ORG_CODE[es_grad$event_year < 10000]))) |>
+  kable(caption = "Analysis samples")
+```
+
+```{r}
+
+# corrleation between student achievement and grad rate
+
+grad_m |>
+  inner_join(student_achievement |>
+               filter(ORG_TYPE %in% c("Public School", "Charter School"),
+                      STU_GRP == "All Students", TEST_GRADE == "10",
+                      SUBJECT_CODE %in% c("ELA", "MATH")) |>
+               select(SY, ORG_CODE, subject = SUBJECT_CODE, me10 = M_PLUS_E_PCT),
+             by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(me10)) |>
+  group_by(subject) |>
+  mutate(subject = paste0(subject, " (r = ", round(cor(me10, grad), 2), ")")) |>
+  ungroup() |>
+  ggplot(aes(x = me10, y = grad)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
+  facet_wrap(~subject) +
+  labs(title = "Graduation Rate vs. Grade 10 Achievement",
+       x = "grade 10 % meeting or exceeding expectations",
+       y = "4-year adjusted graduation rate")
+
+
+# corr between grad rate and retention, modulated by achievemnet (grad rate x ach) vs ret
+grad_m |>
+  inner_join(student_achievement |>
+               filter(ORG_TYPE %in% c("Public School", "Charter School"),
+                      STU_GRP == "All Students", TEST_GRADE == "10",
+                      SUBJECT_CODE %in% c("ELA", "MATH")) |>
+               group_by(SY, ORG_CODE) |>
+               summarise(me10 = mean(M_PLUS_E_PCT, na.rm = TRUE), .groups = "drop"),
+             by = c("SY", "ORG_CODE")) |>
+  filter(!is.na(me10)) |>
+  mutate(achievement = factor(ntile(me10, 3), labels = c("Low", "Mid", "High"))) |>
+  ggplot(aes(x = teach_ret_4yr, y = grad, color = achievement)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Graduation Rate vs. Teacher Retention, by School Achievement",
+       x = "teacher retention (4-yr avg)",
+       y = "4-year adjusted graduation rate",
+       color = "grade 10\nachievement")
+```
+
+```{r}
+#| label: model-1
+#| message: false
+
+
+# Model 1: nested blocks. csw() adds each block cumulatively:
+#   (1) student characteristics -> (2) + charter -> (3) + staffing
+# Year effects enter as dummies (factor(SY)), which is identical to year fixed
+# effects and lets marginaleffects compute clustered standard errors.
+
+m1_ela <- feols(sgp ~ factor(SY) + csw(low_inc + black_his + male + log(stu_n),
+                                       charter,
+                                       teach_ret10 + princ_left),
+                data = filter(ach, subject == "ELA"),
+                weights = ~stu_n, cluster = ~ORG_CODE)
+
+m1_math <- feols(sgp ~ factor(SY) + csw(low_inc + black_his + male + log(stu_n),
+                                        charter,
+                                        teach_ret10 + princ_left),
+                 data = filter(ach, subject == "MATH"),
+                 weights = ~stu_n, cluster = ~ORG_CODE)
+
+etable(m1_ela, m1_math, drop = "SY", fitstat = ~ r2 + n,
+       headers = c(rep("SGP ELA", 3), rep("SGP Math", 3)))
+
+m1_grad <- feglm(grad ~ factor(SY) + csw(low_inc + black_his + male + hom_fos + log(cohort_n),
+                                         charter,
+                                         teach_ret10_4yr + princ_dep_4yr),
+                 data = grad_m, family = "logit",
+                 weights = ~cohort_n, cluster = ~ORG_CODE)
+
+etable(m1_grad, drop = "SY", fitstat = ~ pr2 + n)
+
+# Average marginal effects (percentage points) from the full graduation model
+avg_slopes(m1_grad[[3]],
+           variables = c("low_inc", "black_his", "male", "hom_fos",
+                         "charter", "teach_ret10_4yr", "princ_dep_4yr"))
+```
+
+```{r}
+#| label: model-2
+#| message: false
+
+#| label: model-2
+#| message: false
+
+# Model 2: does the retention association differ by school poverty?
+m2_ela <- feols(sgp ~ teach_ret10 * low_inc_c + black_his + male + log(stu_n) +
+                  charter + princ_left + factor(SY),
+                data = filter(ach, subject == "ELA"),
+                weights = ~stu_n, cluster = ~ORG_CODE)
+
+m2_math <- feols(sgp ~ teach_ret10 * low_inc_c + black_his + male + log(stu_n) +
+                   charter + princ_left + factor(SY),
+                 data = filter(ach, subject == "MATH"),
+                 weights = ~stu_n, cluster = ~ORG_CODE)
+
+m2_grad <- feglm(grad ~ teach_ret10_4yr * low_inc_c + black_his + male + hom_fos +
+                   log(cohort_n) + charter + princ_dep_4yr + factor(SY),
+                 data = grad_m, family = "logit",
+                 weights = ~cohort_n, cluster = ~ORG_CODE)
+
+etable(m2_ela, m2_math, m2_grad, drop = "SY", fitstat = ~ r2 + pr2 + n)
+
+# Effect of +10pp retention by poverty tercile
+avg_slopes(m2_ela,  variables = "teach_ret10",     by = "poverty")
+avg_slopes(m2_math, variables = "teach_ret10",     by = "poverty")
+avg_slopes(m2_grad, variables = "teach_ret10_4yr", by = "poverty")
+
+plot_predictions(m2_grad, condition = list("teach_ret10_4yr", low_inc_c = "threenum")) +
+  labs(title = "Predicted Graduation Rate by Teacher Retention and Poverty",
+       x = "teacher retention, 4-yr avg (10pp units, centered)",
+       y = "predicted graduation rate",
+       color = "low-income share\n(centered)", fill = "low-income share\n(centered)")
+```
+
+```{r}
+#| label: model-3
+#| message: false
+
+# Model 3: event study around a school's first clean principal departure.
+# sunab() = Sun & Abraham estimator for staggered timing; never-treated
+# schools (event_year = 10000) are the comparison group. Period -1 is the
+# reference. School + year fixed effects; clustered by school.
+
+m3_ret  <- feols(teach_ret ~ sunab(event_year, SY) | ORG_CODE + SY,
+                 data = es_staff, cluster = ~ORG_CODE)
+
+m3_grad <- feols(grad ~ sunab(event_year, SY) | ORG_CODE + SY,
+                 data = es_grad, weights = ~cohort_n, cluster = ~ORG_CODE)
+
+m3_ela  <- feols(sgp ~ sunab(event_year, SY) | ORG_CODE + SY,
+                 data = filter(es_ach, subject == "ELA"), cluster = ~ORG_CODE)
+
+m3_math <- feols(sgp ~ sunab(event_year, SY) | ORG_CODE + SY,
+                 data = filter(es_ach, subject == "MATH"), cluster = ~ORG_CODE)
+
+etable(m3_ret, m3_grad, m3_ela, m3_math,
+       headers = c("Teacher retention", "Grad rate", "SGP ELA", "SGP Math"))
+
+# Event-study plots: pre-period coefficients should be near 0 (parallel trends)
+par(mfrow = c(2, 2))
+iplot(m3_ret,  main = "Teacher retention",       xlab = "years since principal departure")
+iplot(m3_grad, main = "4-yr adjusted grad rate", xlab = "years since principal departure")
+iplot(m3_ela,  main = "SGP, ELA",                xlab = "years since principal departure")
+iplot(m3_math, main = "SGP, Math",               xlab = "years since principal departure")
+par(mfrow = c(1, 1))
+
+# Average post-departure effect (all periods >= 0) for each outcome
+summary(m3_ret,  agg = "ATT")
+summary(m3_grad, agg = "ATT")
+```
+
+```{r}
+#| label: session-info
+writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
+```
+
+```{r}
+
+pkgs <- c("tidyverse","patchwork", "knitr", "skimr" , "fixest", "marginaleffects")
+data.frame(package = pkgs, version = sapply(pkgs, \(p) as.character(packageVersion(p))))
+```
+
+```{r}
+#| label: save-results
+#| message: false
+
+# Saves everything the memo needs, so memo.qmd only formats results.
+dir.create("output", showWarnings = FALSE)
+
+# ---- Table 1: memo Models 1-2 (Stock & Watson-style table) -------------------
+# Columns: (1)-(2) SGP ELA, (3)-(4) SGP Math, (5)-(6) graduation.
+# Odd columns = Student Composition Model (m1_*[[1]]);
+# even columns = School Staffing Model (m1_*[[3]]).
+# OLS coefficients are in SGP points. Graduation entries are average marginal
+# effects from the fractional logit, in percentage points.
+# Shares are rescaled to "per 10 percentage points".
+ols_terms  <- c(ret = "teach_ret10", princ = "princ_left", low_inc = "low_inc",
+                black_his = "black_his", male = "male", charter = "charter")
+grad_terms <- c(ret = "teach_ret10_4yr", princ = "princ_dep_4yr", low_inc = "low_inc",
+                black_his = "black_his", male = "male", charter = "charter")
+
+tidy_ols <- function(m, col) {
+  ct <- coeftable(m)
+  tibble(term = rownames(ct), est = ct[, 1], se = ct[, 2]) |>
+    filter(term %in% ols_terms) |>
+    mutate(key = names(ols_terms)[match(term, ols_terms)], col = col)
+}
+tidy_ame <- function(m, vars, col) {
+  avg_slopes(m, variables = vars) |>
+    as_tibble() |>
+    transmute(term, est = estimate * 100, se = std.error * 100) |>
+    mutate(key = names(grad_terms)[match(term, grad_terms)], col = col)
+}
+
+tab1_long <- bind_rows(
+  tidy_ols(m1_ela[[1]],  "(1)"), tidy_ols(m1_ela[[3]],  "(2)"),
+  tidy_ols(m1_math[[1]], "(3)"), tidy_ols(m1_math[[3]], "(4)"),
+  tidy_ame(m1_grad[[1]], c("low_inc", "black_his", "male"), "(5)"),
+  tidy_ame(m1_grad[[3]], unname(grad_terms), "(6)")) |>
+  mutate(across(c(est, se), ~ if_else(key %in% c("low_inc", "black_his", "male"), .x * 0.1, .x)))
+
+# Fit: R2 for OLS; squared correlation of actual and fitted rates for the logit
+# (fixest's pseudo-R2 is not meaningful for a weighted fractional logit)
+sq_cor <- function(m) {
+  fit <- fitted(m)                              # predicted graduation rates
+  y   <- fit + resid(m, type = "response")      # actual graduation rates
+  cor(y, fit)^2
+}
+
+tab1_fit <- tibble(
+  col = paste0("(", 1:6, ")"),
+  fit = c(r2(m1_ela[[1]], "r2"),  r2(m1_ela[[3]], "r2"),
+          r2(m1_math[[1]], "r2"), r2(m1_math[[3]], "r2"),
+          sq_cor(m1_grad[[1]]), sq_cor(m1_grad[[3]])),
+  n   = c(nobs(m1_ela[[1]]), nobs(m1_ela[[3]]), nobs(m1_math[[1]]), nobs(m1_math[[3]]),
+          nobs(m1_grad[[1]]), nobs(m1_grad[[3]])))
+
+# ---- Figure 1: memo Model 3, Poverty Interaction Model (m2_* objects) -------
+ame_pov <- bind_rows(
+  avg_slopes(m2_ela,  variables = "teach_ret10", by = "poverty") |>
+    as_tibble() |> mutate(outcome = "SGP, ELA (points)"),
+  avg_slopes(m2_math, variables = "teach_ret10", by = "poverty") |>
+    as_tibble() |> mutate(outcome = "SGP, Math (points)"),
+  avg_slopes(m2_grad, variables = "teach_ret10_4yr", by = "poverty") |>
+    as_tibble() |>
+    mutate(across(c(estimate, conf.low, conf.high), ~ .x * 100),
+           outcome = "Graduation rate (pp)")) |>
+  select(outcome, poverty, estimate, conf.low, conf.high)
+
+# ---- Event study (exploratory; m3_* objects), used in the memo's text --------
+es_tidy <- function(m, outcome, scale = 1) {
+  ct <- coeftable(m)
+  tibble(term = rownames(ct), est = ct[, 1] * scale, se = ct[, 2] * scale) |>
+    filter(str_detect(term, "^SY::")) |>
+    mutate(k = as.numeric(str_remove(term, "SY::"))) |>
+    bind_rows(tibble(k = -1, est = 0, se = 0)) |>       # reference period
+    mutate(outcome = outcome)
+}
+es_coefs <- bind_rows(
+  es_tidy(m3_ret,  "Teacher retention (pp)", 100),
+  es_tidy(m3_grad, "Graduation rate (pp)",   100),
+  es_tidy(m3_ela,  "SGP, ELA (points)"),
+  es_tidy(m3_math, "SGP, Math (points)"))
+
+# Average post-departure effect and joint pre-trend test for each outcome
+es_stats <- map_dfr(
+  list(ret = m3_ret, grad = m3_grad, ela = m3_ela, math = m3_math),
+  \(m) {
+    att <- coeftable(summary(m, agg = "ATT"))["ATT", ]
+    pre <- tryCatch(wald(m, keep = "^SY::-", print = FALSE)$p, error = \(e) NA_real_)
+    tibble(att = att[1], att_se = att[2], pretrend_p = pre)
+  }, .id = "outcome")
+
+# Number of treated and never-treated schools in each event-study sample
+es_n <- tibble(
+  sample        = c("retention", "graduation", "achievement"),
+  treated       = c(n_distinct(es_staff$ORG_CODE[es_staff$event_year < 10000]),
+                    n_distinct(es_grad$ORG_CODE[es_grad$event_year < 10000]),
+                    n_distinct(es_ach$ORG_CODE[es_ach$event_year < 10000])),
+  never_treated = c(n_distinct(es_staff$ORG_CODE[es_staff$event_year == 10000]),
+                    n_distinct(es_grad$ORG_CODE[es_grad$event_year == 10000]),
+                    n_distinct(es_ach$ORG_CODE[es_ach$event_year == 10000])))
+
+save(tab1_long, tab1_fit, ame_pov, es_coefs, es_stats, es_n, file = "output/memo_results.RData")
+
+tab1_fit   # graduation fit values should be between 0 and 1
+es_stats   # check these numbers against the memo text
+es_n
+```
